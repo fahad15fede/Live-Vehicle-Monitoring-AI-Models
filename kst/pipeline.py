@@ -1,7 +1,7 @@
 """Orchestrates the cascade for one camera stream:
 
   frame -> VehicleDetector (ONNX) + BikeHelper (COCO two-wheelers) -> tracker
-        -> reading zone (READING_ZONE, 50-100% of frame height):
+        -> reading zone (READING_ZONE, bottom 60% of frame height):
              crossing = count + analyse (best.pt features/plate box -> Pillow clean ->
              RapidOCR plate, Pillow colour, box-geometry shape), re-analysed a few
              times while near the line
@@ -37,6 +37,7 @@ class TrackState:
     last_cy: float | None = None
     in_zone: bool = False
     crossed: bool = False                  # has entered the reading zone
+    entered_this_frame: bool = False
     plate_rel: tuple | None = None         # plate box relative to the vehicle box (0..1)
     plate_src: str | None = None
 
@@ -57,6 +58,7 @@ class TrackState:
             "features": feats,
             "in_zone": self.in_zone,
             "crossed": self.crossed,
+            "entered_this_frame": self.entered_this_frame,
             "plate_rel": self.plate_rel,
             "plate_src": self.plate_src,
         }
@@ -74,7 +76,7 @@ class Pipeline:
         self.tracker = IoUTracker()
         self.states: dict[int, TrackState] = defaultdict(TrackState)
         self.counts: Counter = Counter()          # line crossings per class
-        self.seen: dict[int, dict] = {}           # unique vehicles this run (live table)
+        self.seen: dict[int, dict] = {}           # unique tracks that entered the zone
         self.current_dets: list[Detection] = []
         self.frame_no = 0
         config.CROPS_DIR.mkdir(parents=True, exist_ok=True)
@@ -104,6 +106,7 @@ class Pipeline:
             # Also count vehicles that jumped over the zone between analysed frames.
             jumped = st.last_cy is not None and (
                 (st.last_cy < top and cy > bottom) or (st.last_cy > bottom and cy < top))
+            st.entered_this_frame = not st.crossed and (in_zone or jumped)
             if not st.crossed and (in_zone or jumped):
                 st.crossed = True
                 self.counts[d.class_name] += 1
@@ -123,13 +126,19 @@ class Pipeline:
         return dets
 
     def _update_seen(self, dets: list[Detection]) -> None:
-        """Running set of every unique vehicle track observed in this run."""
+        """Update rows only for tracks that have entered the reading zone."""
         clock = datetime.now().strftime("%H:%M:%S")
+        for row in self.seen.values():
+            row["In zone"] = False
         for d in dets:
+            i = d.info
+            if not i.get("crossed"):
+                continue
             row = self.seen.get(d.track_id)
             if row is None:
-                row = self.seen[d.track_id] = {"ID": d.track_id, "First seen": clock}
-            i = d.info
+                row = self.seen[d.track_id] = {
+                    "ID": d.track_id, "First seen": clock, "In zone": False,
+                }
             row.update({
                 "Type": d.class_name,
                 "Conf": round(max(d.confidence, row.get("Conf", 0.0)), 2),
@@ -138,13 +147,15 @@ class Pipeline:
                 "Shape": i.get("shape") or "",
                 "Features": ", ".join(f for f in i.get("features", []) if f != "no_front_plate_seen"),
                 "Entered zone": bool(i.get("crossed")),
+                "In zone": bool(i.get("in_zone")),
+                "Frame": self.frame_no,
                 "Last seen": clock,
             })
 
     def seen_table(self):
         import pandas as pd
         cols = ["ID", "Type", "Conf", "Plate", "Color", "Shape", "Features",
-                "Entered zone", "First seen", "Last seen"]
+                "Entered zone", "In zone", "Frame", "First seen", "Last seen"]
         return pd.DataFrame(list(self.seen.values()), columns=cols).sort_values(
             "ID", ascending=False)
 
@@ -155,6 +166,8 @@ class Pipeline:
         rows = []
         for d in self.current_dets:
             info = d.info or {}
+            if not (info.get("in_zone") or info.get("entered_this_frame")):
+                continue
             rows.append({
                 "ID": d.track_id,
                 "Type": d.class_name,
@@ -256,7 +269,8 @@ def draw(frame: np.ndarray, dets: list[Detection], zone: tuple[float, float] | N
         x1, y1, x2, y2 = d.box
         col = PALETTE.get(d.class_name, (255, 255, 255))
         info = d.info or {}
-        cv2.rectangle(out, (x1, y1), (x2, y2), col, 3 if info.get("crossed") else 1)
+        highlighted = info.get("in_zone") or info.get("entered_this_frame")
+        cv2.rectangle(out, (x1, y1), (x2, y2), col, 3 if highlighted else 1)
         rel = info.get("plate_rel")
         clipped = y1 <= 1 or x1 <= 1 or y2 >= H - 2 or x2 >= W - 2   # relative pos. unreliable
         if rel and not clipped:   # plate box follows the vehicle: stored relative to the vehicle box

@@ -37,9 +37,9 @@ CLASS_WEIGHT = {"auto_rickshaw": 1.6, "qingqi": 1.3}
 # plateReader.pt is a COCO YOLOv8n; reused as a helper for two-wheelers (COCO 1=bicycle, 3=motorcycle).
 BIKE_HELPER_CONF = 0.20
 
-# Reading zone, as fractions of frame height (top, bottom). Vehicles are counted when
-# they enter it and analysed (plate / features / colour) while inside it.
-READING_ZONE = (0.50, 1.00)
+# Reading zone, as fractions of frame height (top, bottom): the bottom 60% of the video.
+# Vehicles are counted when they enter it and analysed (plate / features / colour) while inside it.
+READING_ZONE = (0.40, 1.00)
 MAX_ANALYSES_PER_TRACK = 4
 ANALYSES_PER_FRAME = 3          # CPU cap, internal only
 # Burned-in camera on-screen text (timestamp / MAC address), as frame fractions

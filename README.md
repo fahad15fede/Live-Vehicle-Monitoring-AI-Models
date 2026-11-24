@@ -39,10 +39,11 @@ app.py  (UI only): Live monitor · Photo check · Search · Records · Models
 - **plateReader.pt is a stock COCO YOLOv8n** (80 generic classes, trained 2022). It cannot
   read plates, so it is used as a **two-wheeler helper** instead. Bicycle/motorcycle boxes are
   merged with the rider's person box, which catches bikes the main model scores below 0.1.
-- **Reading zone** at 50-100% of frame height (`READING_ZONE` in `kst/config.py`). Vehicles are
-  counted when they enter it and analysed (plate, features, colour) while inside it. The live
-  overlay/table shows all detections in real time; the final table keeps the unique tracks from
-  analyzed frames.
+- **Reading zone** covers the bottom 60% of frame height, from 40% to 100%
+  (`READING_ZONE` in `kst/config.py`). Vehicles are counted when they enter it and analysed
+  (plate, features, colour) while inside it. The live table shows only vehicles in the zone
+  for the displayed frame, synchronized with the highlighted detections; the final table keeps
+  one row for every unique track that entered the zone.
 - **Plate boxes** (magenta) come from: best.pt `front_plate` if conf >= 0.35 (rarely: the head is
   weak), else RapidOCR's DBNet text detector on the lower part of the vehicle, else a Pillow
   bright-rectangle search. Text is then read by RapidOCR. Burned-in camera text is masked

@@ -133,7 +133,8 @@ def read_frame(skip: int):
 def finish_stream(reason: str) -> None:
     pl = st.session_state.pipeline
     st.session_state.finished = {"reason": reason, "counts": dict(pl.counts),
-                                 "tracks": pl.tracker.next_id - 1, "camera": pl.camera_id}
+                                 "tracks": pl.tracker.next_id - 1, "camera": pl.camera_id,
+                                 "rows": pl.seen_table().to_dict("records")}
     stop_stream()
 
 
@@ -176,8 +177,7 @@ def live_tab(p: dict) -> None:
                        f"({done['tracks']} tracked in total). Results are in **Search** / **Records**.")
             if done["counts"]:
                 st.bar_chart(pd.Series(done["counts"], name="vehicles"))
-            if st.session_state.get("pipeline") is not None:
-                all_frames_table(st.session_state.pipeline)
+            all_frames_table(done["rows"])
         else:
             st.info("Choose a source in the sidebar and press **Start**. Vehicles are counted, "
                     "and their plate, features and colour are read, inside the reading zone "
@@ -208,37 +208,46 @@ def live_tab(p: dict) -> None:
         with right:
             a, b, c = st.columns(3)
             a.metric("In frame", len(dets))
-            b.metric("Unique", len(pl.seen))
+            b.metric("Zone vehicles", len(pl.seen))
             c.metric("Read in zone", sum(pl.counts.values()))
             type_counts = Counter(r["Type"] for r in pl.seen.values())
             if type_counts:
                 st.caption(" · ".join(f"**{k}** {v}" for k, v in type_counts.most_common()))
-        current_frame_table(pl)
     loop()
+    zone_entries_table()
 
 
-def current_frame_table(pl: Pipeline) -> None:
-    df = pl.frame_table()
-    st.subheader(f"Vehicles detected in this frame ({len(df)})")
-    if df.empty:
-        st.caption("No vehicles were detected in this frame.")
+@st.fragment(run_every=0.2)
+def zone_entries_table() -> None:
+    if not st.session_state.get("running"):
         return
+    pl = st.session_state.pipeline
+    df = pl.seen_table().reset_index(drop=True)
+    st.subheader(f"Reading-zone vehicle entries ({len(df)})")
+    st.caption(f"Updated through analyzed frame {pl.frame_no}.")
     st.dataframe(df, hide_index=True, width="stretch", height=360,
+                 key=f"live_zone_entries_{pl.run_id}",
                  column_config={"Conf": st.column_config.ProgressColumn(
                      "Conf", min_value=0.0, max_value=1.0, format="%.2f"),
-                     "Entered zone": st.column_config.CheckboxColumn("Entered zone")})
+                     "Entered zone": st.column_config.CheckboxColumn("Entered zone"),
+                     "In zone": st.column_config.CheckboxColumn("In zone")})
 
 
-def all_frames_table(pl: Pipeline) -> None:
-    df = pl.seen_table()
-    st.subheader(f"Vehicles detected across analyzed frames ({len(df)})")
+def all_frames_table(rows: list[dict]) -> None:
+    df = pd.DataFrame(rows, columns=[
+        "ID", "Type", "Conf", "Plate", "Color", "Shape", "Features",
+        "Entered zone", "In zone", "Frame", "First seen", "Last seen",
+    ])
+    st.subheader(f"Vehicles that entered the reading zone ({len(df)})")
     if df.empty:
-        st.caption("No vehicles were detected in the analyzed frames.")
+        st.caption("No vehicles have entered the reading zone.")
         return
     st.dataframe(df, hide_index=True, width="stretch", height=360,
+                 key="final_zone_entries",
                  column_config={"Conf": st.column_config.ProgressColumn(
                      "Conf", min_value=0.0, max_value=1.0, format="%.2f"),
-                     "Entered zone": st.column_config.CheckboxColumn("Entered zone")})
+                     "Entered zone": st.column_config.CheckboxColumn("Entered zone"),
+                     "In zone": st.column_config.CheckboxColumn("In zone")})
 
 
 def image_tab(p: dict) -> None:

@@ -1,8 +1,8 @@
-numpy>=1.24
-onnxruntime>=1.18
-opencv-python-headless>=4.8
-pandas>=2.0
-pillow>=10
-streamlit>=1.40,<2
-ultralytics>=8.3
-rapidocr_onnxruntime>=1.3
+numpy
+onnxruntime
+opencv-python-headless
+pandas
+pillow
+streamlit
+ultralytics
+rapidocr_onnxruntime
