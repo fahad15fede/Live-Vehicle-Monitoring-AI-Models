@@ -19,15 +19,20 @@ import pandas as pd
 import streamlit as st
 from PIL import Image
 
-from kst import config, storage
-from kst.analyzers import VehicleAnalyzer
-from kst.detector import BikeHelper, VehicleDetector
-from kst.pipeline import Pipeline, draw
+from kst import config, database
+from kst.appearance import COLOR_NAMES
+from kst.overlay import draw_detections
+from kst.pipeline import ZONE_TABLE_COLUMNS, Pipeline
+from kst.vehicle_analysis import VehicleAnalyzer
+from kst.vehicle_detection import TwoWheelerDetector, VehicleDetector
 
 st.set_page_config(page_title="Karachi Smart Traffic AI", page_icon="🚦", layout="wide")
 
-COLORS = ["white", "silver", "gray", "black", "red", "orange", "yellow", "green",
-          "blue", "purple", "brown"]
+ZONE_TABLE_CONFIG = {
+    "Conf": st.column_config.ProgressColumn("Conf", min_value=0.0, max_value=1.0, format="%.2f"),
+    "Entered zone": st.column_config.CheckboxColumn("Entered zone"),
+    "In zone": st.column_config.CheckboxColumn("In zone"),
+}
 
 
 # ---------------------------------------------------------------- models
@@ -41,21 +46,22 @@ def get_analyzer() -> VehicleAnalyzer:
     return VehicleAnalyzer()
 
 
-@st.cache_resource(show_spinner="Loading two-wheeler helper (plateReader.pt / COCO)...")
-def get_bike_helper():
+@st.cache_resource(show_spinner="Loading two-wheeler detector (plateReader.pt / COCO)...")
+def get_two_wheeler_detector():
     try:
-        return BikeHelper()
+        return TwoWheelerDetector()
     except Exception:   # optional: missing / replaced weights just disable it
         return None
 
 
 @st.cache_resource
 def get_db():
-    return storage.connect()
+    return database.connect()
 
 
 def new_pipeline(cam_id: str) -> Pipeline:
-    return Pipeline(get_detector(), get_analyzer(), get_db(), cam_id, bike_helper=get_bike_helper())
+    return Pipeline(get_detector(), get_analyzer(), get_db(), cam_id,
+                    two_wheeler_detector=get_two_wheeler_detector())
 
 
 # ---------------------------------------------------------------- stream control
@@ -96,7 +102,7 @@ def start_stream(kind: str, cam_index: int, rtsp: str, upload) -> None:
         cap = cv2.VideoCapture(_tmp_video(upload.getvalue(), Path(upload.name).suffix or ".mp4"))
         cam_id = "KHI-UPLOAD-01"
     else:
-        with zipfile.ZipFile(config.OUTPUTS_ARCHIVE) as z:
+        with zipfile.ZipFile(config.DEMO_ARCHIVE) as z:
             cap = cv2.VideoCapture(_tmp_video(z.read(config.DEMO_VIDEO_MEMBER), ".mp4"))
         cam_id = "KHI-DEMO-01"
     if not cap.isOpened():
@@ -203,7 +209,7 @@ def live_tab(p: dict) -> None:
             pos = int(st.session_state.cap.get(cv2.CAP_PROP_POS_FRAMES))
             left.progress(min(1.0, pos / st.session_state.total_frames))
             caption += f" · frame {pos}/{st.session_state.total_frames}"
-        left.image(draw(frame, dets, pl.zone, pl.counts), channels="BGR",
+        left.image(draw_detections(frame, dets, pl.zone, pl.counts), channels="BGR",
                    width="stretch", caption=caption)
         with right:
             a, b, c = st.columns(3)
@@ -226,28 +232,17 @@ def zone_entries_table() -> None:
     st.subheader(f"Reading-zone vehicle entries ({len(df)})")
     st.caption(f"Updated through analyzed frame {pl.frame_no}.")
     st.dataframe(df, hide_index=True, width="stretch", height=360,
-                 key=f"live_zone_entries_{pl.run_id}",
-                 column_config={"Conf": st.column_config.ProgressColumn(
-                     "Conf", min_value=0.0, max_value=1.0, format="%.2f"),
-                     "Entered zone": st.column_config.CheckboxColumn("Entered zone"),
-                     "In zone": st.column_config.CheckboxColumn("In zone")})
+                 key=f"live_zone_entries_{pl.run_id}", column_config=ZONE_TABLE_CONFIG)
 
 
 def all_frames_table(rows: list[dict]) -> None:
-    df = pd.DataFrame(rows, columns=[
-        "ID", "Type", "Conf", "Plate", "Color", "Shape", "Features",
-        "Entered zone", "In zone", "Frame", "First seen", "Last seen",
-    ])
+    df = pd.DataFrame(rows, columns=ZONE_TABLE_COLUMNS)
     st.subheader(f"Vehicles that entered the reading zone ({len(df)})")
     if df.empty:
         st.caption("No vehicles have entered the reading zone.")
         return
     st.dataframe(df, hide_index=True, width="stretch", height=360,
-                 key="final_zone_entries",
-                 column_config={"Conf": st.column_config.ProgressColumn(
-                     "Conf", min_value=0.0, max_value=1.0, format="%.2f"),
-                     "Entered zone": st.column_config.CheckboxColumn("Entered zone"),
-                     "In zone": st.column_config.CheckboxColumn("In zone")})
+                 key="final_zone_entries", column_config=ZONE_TABLE_CONFIG)
 
 
 def image_tab(p: dict) -> None:
@@ -261,7 +256,7 @@ def image_tab(p: dict) -> None:
     if not dets:   # close-up photo the detector misses: analyse the whole image as one vehicle
         dets = [pipe.analyze_whole_image(frame, p["feat_conf"], p["plate_conf"])]
         st.warning("No vehicle detected, so the whole image was analysed as one vehicle.")
-    st.image(draw(frame, dets), channels="BGR", width="stretch")
+    st.image(draw_detections(frame, dets), channels="BGR", width="stretch")
     st.json([{"id": d.track_id, "type": d.class_name, "conf": round(d.confidence, 3), **d.info}
              for d in dets])
 
@@ -274,11 +269,11 @@ def search_tab() -> None:
                      help="Lower finds more OCR-garbled plates (O/0, B/8, S/5 are treated alike).")
     c3, c4, c5 = st.columns(3)
     types = c3.multiselect("Vehicle type", get_detector().names)
-    colors = c4.multiselect("Color", COLORS)
-    feat_names = [n for n in (get_analyzer().features.names.values()
-                              if get_analyzer().features else [])] + ["no_front_plate_seen"]
+    colors = c4.multiselect("Color", COLOR_NAMES)
+    features = get_analyzer().features
+    feat_names = (list(features.names.values()) if features else []) + ["no_front_plate_seen"]
     feats = c5.multiselect("Has features", feat_names)
-    df = storage.search(con, plate, types, colors, feats, fuzz)
+    df = database.search(con, plate, types, colors, feats, fuzz)
     st.write(f"**{len(df)}** matching sightings")
     if df.empty:
         return
@@ -298,14 +293,14 @@ def search_tab() -> None:
 
 def records_tab() -> None:
     con = get_db()
-    df = storage.all_records(con)
+    df = database.all_records(con)
     st.dataframe(df.drop(columns=["plate_norm"], errors="ignore"), width="stretch",
                  hide_index=True)
     st.download_button("Download CSV", df.to_csv(index=False), "sightings.csv")
     with st.expander("Danger zone"):
         if st.checkbox("I understand this deletes every stored sighting") and \
                 st.button("Delete all records"):
-            storage.clear(con)
+            database.clear(con)
             st.rerun()
 
 
@@ -315,15 +310,14 @@ def models_tab() -> None:
 | Stage | Model | Status |
 |---|---|---|
 | Vehicle detection | `vehicle_det_fp16.onnx` (YOLO11m) | ✅ {', '.join(det.names)} · {det.session.get_providers()[0]} |
-| Features + plate box | `best.pt` (YOLOv8n) | {'✅ ' + ', '.join(an.features.names.values()) if an.features else '❌ ' + an.errors.get('features', '')} |
-| Plate OCR | RapidOCR (PaddleOCR on ONNX) + Pillow cleaning | {'✅' if an.plates else '❌ ' + an.errors.get('ocr', '')} |
-| Two-wheeler helper | `plateReader.pt` (COCO YOLOv8n: bicycle + motorcycle) | {'✅ active, adds bikes the main model misses' if get_bike_helper() else '❌ unavailable'} |
-| Plate reader slot | `plateReader.pt` | {'⚠️ ' + an.custom_plate.status if an.custom_plate else '❌ ' + an.errors.get('plateReader.pt', '')} |
+| Features | `best.pt` (YOLOv8n) | {'✅ ' + ', '.join(an.features.names.values()) if an.features else '❌ ' + an.errors.get('features', '')} |
+| Plate detection + OCR | fast-alpr: `{config.ALPR_DETECTOR}` + `{config.ALPR_OCR}` (ONNX) | {'✅' if an.alpr else '❌ ' + an.errors.get('fast-alpr', '') + ' (falling back to best.pt / RapidOCR)'} |
+| Plate OCR fallback | RapidOCR (PaddleOCR on ONNX) + Pillow cleaning | {'✅' if an.plates else '❌ ' + an.errors.get('ocr', '')} |
+| Two-wheeler detector | `plateReader.pt` (COCO YOLOv8n: bicycle + motorcycle) | {'✅ active, adds bikes the main model misses' if get_two_wheeler_detector() else '❌ unavailable'} |
 | Color | Pillow Shades-of-Gray + HSV voting | ✅ heuristic (no colour model delivered) |
 | Shape | Box geometry + vehicle class | ✅ heuristic |
 | Tracking | IoU tracker + per-track majority votes | ✅ |
 """)
-    st.caption("Drop real plate-detector weights over plateReader.pt and restart to activate that slot.")
 
 
 def main() -> None:

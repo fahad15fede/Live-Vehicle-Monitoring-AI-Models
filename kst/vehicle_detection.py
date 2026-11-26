@@ -1,4 +1,8 @@
-"""Stage 1: YOLO11m vehicle detector (FP16 ONNX via onnxruntime)."""
+"""Stage 1: vehicle detection.
+
+  * VehicleDetector     - vehicle_det_fp16.onnx (YOLO11m, FP16 ONNX via onnxruntime)
+  * TwoWheelerDetector  - plateReader.pt (stock COCO YOLOv8n): bikes the main model misses
+"""
 from __future__ import annotations
 
 import ast
@@ -20,6 +24,22 @@ class Detection:
     track_id: int = -1
     info: dict[str, Any] = field(default_factory=dict)
     class_scores: dict | None = None   # {class: share}, used for track soft-voting
+
+
+def iou(a, b) -> float:
+    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+    union = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _iou_many(b: np.ndarray, bs: np.ndarray) -> np.ndarray:
+    ix1, iy1 = np.maximum(b[0], bs[:, 0]), np.maximum(b[1], bs[:, 1])
+    ix2, iy2 = np.minimum(b[2], bs[:, 2]), np.minimum(b[3], bs[:, 3])
+    inter = np.clip(ix2 - ix1, 0, None) * np.clip(iy2 - iy1, 0, None)
+    area = (b[2] - b[0]) * (b[3] - b[1]) + (bs[:, 2] - bs[:, 0]) * (bs[:, 3] - bs[:, 1])
+    return inter / np.maximum(area - inter, 1e-6)
 
 
 class VehicleDetector:
@@ -87,27 +107,19 @@ class VehicleDetector:
         return out
 
 
-def _iou_many(b: np.ndarray, bs: np.ndarray) -> np.ndarray:
-    ix1, iy1 = np.maximum(b[0], bs[:, 0]), np.maximum(b[1], bs[:, 1])
-    ix2, iy2 = np.minimum(b[2], bs[:, 2]), np.minimum(b[3], bs[:, 3])
-    inter = np.clip(ix2 - ix1, 0, None) * np.clip(iy2 - iy1, 0, None)
-    area = (b[2] - b[0]) * (b[3] - b[1]) + (bs[:, 2] - bs[:, 0]) * (bs[:, 3] - bs[:, 1])
-    return inter / np.maximum(area - inter, 1e-6)
-
-
-class BikeHelper:
+class TwoWheelerDetector:
     """Uses the COCO YOLOv8n in plateReader.pt to catch two-wheelers the main model misses."""
 
     COCO_TWO_WHEELERS = (1, 3)   # bicycle, motorcycle
 
-    def __init__(self, path=config.PLATE_MODEL):
+    def __init__(self, path=config.TWO_WHEELER_MODEL):
         from ultralytics import YOLO
         self.model = YOLO(str(path))
         names = {int(k): str(v) for k, v in self.model.names.items()}
         if names.get(3) != "motorcycle":
-            raise ValueError("plateReader.pt is no longer the COCO model; bike helper disabled")
+            raise ValueError("plateReader.pt is no longer the COCO model; two-wheeler detector disabled")
 
-    def __call__(self, frame: np.ndarray, conf: float = config.BIKE_HELPER_CONF) -> list[Detection]:
+    def __call__(self, frame: np.ndarray, conf: float = config.TWO_WHEELER_CONF) -> list[Detection]:
         """Two-wheelers, with rider fusion: a weak bike box (>= 0.08) that touches a person
         box becomes one 'motorcycle + rider' box. Lone bikes need `conf`; lone people are ignored."""
         r = self.model.predict(frame, conf=0.08, classes=[0, *self.COCO_TWO_WHEELERS],
@@ -118,7 +130,7 @@ class BikeHelper:
             (people if int(b.cls) == 0 else bikes).append((box, c))
         out = []
         for box, c in bikes:
-            rider = max(((p, pc) for p, pc in people if _touches(box, p) and pc >= 0.25),
+            rider = max(((p, pc) for p, pc in people if _is_rider(box, p) and pc >= 0.25),
                         key=lambda t: t[1], default=None)
             if rider:
                 p = rider[0]
@@ -130,15 +142,14 @@ class BikeHelper:
         return out
 
 
-def _touches(bike, person) -> bool:
+def _is_rider(bike, person) -> bool:
     """Person overlaps the bike horizontally and sits on / above it (a rider)."""
     ox = min(bike[2], person[2]) - max(bike[0], person[0])
     return ox > 0.3 * min(bike[2] - bike[0], person[2] - person[0]) and \
         person[1] <= bike[1] + 0.5 * (bike[3] - bike[1]) and person[3] >= bike[1]
 
 
-def merge_bikes(dets: list[Detection], bikes: list[Detection]) -> list[Detection]:
-    from .tracker import iou
+def merge_two_wheelers(dets: list[Detection], bikes: list[Detection]) -> list[Detection]:
     for b in bikes:
         best, best_iou = None, 0.0
         for d in dets:

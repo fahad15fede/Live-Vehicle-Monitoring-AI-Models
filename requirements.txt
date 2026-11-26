@@ -6,3 +6,4 @@ pillow
 streamlit
 ultralytics
 rapidocr_onnxruntime
+fast-alpr[onnx]

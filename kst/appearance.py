@@ -10,8 +10,11 @@ from __future__ import annotations
 import numpy as np
 from PIL import Image
 
-from .imaging import shades_of_gray
+from .image_utils import shades_of_gray
 
+# Every name estimate_color can return (besides "unknown"); used by the search filter.
+COLOR_NAMES = ["white", "silver", "gray", "black", "red", "orange", "yellow", "green",
+               "blue", "purple", "brown"]
 # (name, hue range in degrees) for chromatic colours.
 _HUES = [
     ("red", 0, 15), ("orange", 15, 40), ("yellow", 40, 70), ("green", 70, 165),
