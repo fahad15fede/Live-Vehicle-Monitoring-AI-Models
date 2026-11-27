@@ -1,6 +1,7 @@
 """Stage 1: vehicle detection.
 
-  * VehicleDetector     - vehicle_det_fp16.onnx (YOLO11m, FP16 ONNX via onnxruntime)
+  * VehicleDetector     - yollo-world.pt (YOLOv8x-World fine-tune, better rickshaw recall)
+                          or vehicle_det_fp16.onnx (YOLO11m, FP16 ONNX via onnxruntime)
   * TwoWheelerDetector  - plateReader.pt (stock COCO YOLOv8n): bikes the main model misses
 """
 from __future__ import annotations
@@ -44,9 +45,22 @@ def _iou_many(b: np.ndarray, bs: np.ndarray) -> np.ndarray:
 
 class VehicleDetector:
     def __init__(self, path=config.VEHICLE_MODEL):
+        self.yolo = None
+        self.model_file = config.Path(path).name
+        if str(path).endswith(".pt"):          # Ultralytics checkpoint (YOLO / YOLO-World)
+            from ultralytics import YOLO
+            self.yolo = YOLO(str(path))
+            # Normalise names so the rest of the pipeline sees e.g. "auto_rickshaw".
+            self.names = [str(self.yolo.names[i]).strip().replace(" ", "_")
+                          for i in sorted(self.yolo.names)]
+            import torch
+            arch = type(self.yolo.model).__name__.replace("Model", "")   # e.g. "World"
+            self.backend = f"Ultralytics {arch} · {'CUDA' if torch.cuda.is_available() else 'CPU'}"
+            return
         providers = [p for p in ("CUDAExecutionProvider", "CPUExecutionProvider")
                      if p in ort.get_available_providers()]
         self.session = ort.InferenceSession(str(path), providers=providers)
+        self.backend = f"ONNX · {self.session.get_providers()[0]}"
         inp = self.session.get_inputs()[0]
         self.input_name = inp.name
         self.size = inp.shape[2] if isinstance(inp.shape[2], int) else 640
@@ -65,7 +79,22 @@ class VehicleDetector:
         canvas[py:py + nh, px:px + nw] = cv2.resize(frame, (nw, nh))
         return canvas, s, px, py
 
+    def _predict_pt(self, frame: np.ndarray, conf: float) -> list[Detection]:
+        floors = [min(conf, config.CLASS_CONF_FLOOR.get(n, conf)) for n in self.names]
+        r = self.yolo.predict(frame, conf=min(floors), iou=config.NMS_IOU, imgsz=640,
+                              agnostic_nms=True, verbose=False)[0]
+        out = []
+        for b in r.boxes:
+            c, score = int(b.cls), float(b.conf)
+            x1, y1, x2, y2 = (int(v) for v in b.xyxy[0].tolist())
+            if score < floors[c] or x2 - x1 < 4 or y2 - y1 < 4:
+                continue
+            out.append(Detection((x1, y1, x2, y2), self.names[c], score))
+        return out
+
     def __call__(self, frame: np.ndarray, conf: float = config.VEHICLE_CONF) -> list[Detection]:
+        if self.yolo is not None:
+            return self._predict_pt(frame, conf)
         img, s, px, py = self._letterbox(frame)
         t = np.ascontiguousarray(img[:, :, ::-1].transpose(2, 0, 1)[None], np.float32) / 255.0
         if self.fp16:

@@ -47,12 +47,8 @@ def draw_detections(frame: np.ndarray, dets: list[Detection], zone: tuple[float,
         lines = [f"#{d.track_id} {d.class_name} {d.confidence:.0%}"]
         if info.get("plate_text"):
             lines.append(f"PLATE {info['plate_text']}")
-        tail = info.get("color") or ""
-        feats = [f for f in info.get("features", []) if f not in ("front_plate", "no_front_plate_seen")]
-        if feats:
-            tail += " | " + ",".join(f.replace("_", " ") for f in feats)
-        if tail.strip():
-            lines.append(tail.strip())
+        if info.get("color"):
+            lines.append(info["color"])
         y = max(14, y1 - 6 - 16 * (len(lines) - 1))
         for line in lines:
             (tw, th), _ = cv2.getTextSize(line, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)

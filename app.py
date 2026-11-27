@@ -5,7 +5,6 @@ Run:  python -m streamlit run app.py
 """
 from __future__ import annotations
 
-import json
 import os
 import tempfile
 import time
@@ -36,18 +35,20 @@ ZONE_TABLE_CONFIG = {
 
 
 # ---------------------------------------------------------------- models
-@st.cache_resource(show_spinner="Loading vehicle detector (ONNX)...")
+@st.cache_resource(show_spinner="Loading vehicle detector (yollo-world.pt)...")
 def get_detector() -> VehicleDetector:
     return VehicleDetector()
 
 
-@st.cache_resource(show_spinner="Loading feature model, plate OCR...")
+@st.cache_resource(show_spinner="Loading plate detector + OCR...")
 def get_analyzer() -> VehicleAnalyzer:
     return VehicleAnalyzer()
 
 
 @st.cache_resource(show_spinner="Loading two-wheeler detector (plateReader.pt / COCO)...")
 def get_two_wheeler_detector():
+    if not config.USE_TWO_WHEELER_DETECTOR:
+        return None
     try:
         return TwoWheelerDetector()
     except Exception:   # optional: missing / replaced weights just disable it
@@ -168,7 +169,6 @@ def sidebar() -> dict:
         p = {
             "skip": skip,
             "vehicle_conf": st.slider("Vehicle", 0.05, 0.9, config.VEHICLE_CONF, 0.05),
-            "feat_conf": st.slider("Features (best.pt)", 0.05, 0.9, config.FEATURE_CONF, 0.05),
             "plate_conf": st.slider("Plate OCR", 0.05, 0.9, config.PLATE_CONF, 0.05),
         }
     return p
@@ -186,7 +186,7 @@ def live_tab(p: dict) -> None:
             all_frames_table(done["rows"])
         else:
             st.info("Choose a source in the sidebar and press **Start**. Vehicles are counted, "
-                    "and their plate, features and colour are read, inside the reading zone "
+                    "and their plate and colour are read, inside the reading zone "
                     f"({config.READING_ZONE[0]:.0%}-{config.READING_ZONE[1]:.0%} of the frame height).")
         return
 
@@ -200,7 +200,7 @@ def live_tab(p: dict) -> None:
             st.rerun()
         pl = st.session_state.pipeline
         t0 = time.time()
-        dets = pl.process(frame, p["vehicle_conf"], p["feat_conf"], p["plate_conf"])
+        dets = pl.process(frame, p["vehicle_conf"], p["plate_conf"])
         dt = time.time() - t0
         left, right = st.columns([3, 1.3])
         caption = (f"{pl.camera_id} · analysed frame #{st.session_state.analysed_frames} "
@@ -252,9 +252,9 @@ def image_tab(p: dict) -> None:
         return
     frame = cv2.cvtColor(np.asarray(Image.open(up).convert("RGB")), cv2.COLOR_RGB2BGR)
     pipe = new_pipeline("KHI-PHOTO")
-    dets = pipe.process_photo(frame, p["vehicle_conf"], p["feat_conf"], p["plate_conf"])
+    dets = pipe.process_photo(frame, p["vehicle_conf"], p["plate_conf"])
     if not dets:   # close-up photo the detector misses: analyse the whole image as one vehicle
-        dets = [pipe.analyze_whole_image(frame, p["feat_conf"], p["plate_conf"])]
+        dets = [pipe.analyze_whole_image(frame, p["plate_conf"])]
         st.warning("No vehicle detected, so the whole image was analysed as one vehicle.")
     st.image(draw_detections(frame, dets), channels="BGR", width="stretch")
     st.json([{"id": d.track_id, "type": d.class_name, "conf": round(d.confidence, 3), **d.info}
@@ -267,13 +267,10 @@ def search_tab() -> None:
     plate = c1.text_input("Plate number (partial OK, e.g. BKA 492, KHI, 492)")
     fuzz = c2.slider("Plate match strictness", 0.3, 1.0, 0.6, 0.05,
                      help="Lower finds more OCR-garbled plates (O/0, B/8, S/5 are treated alike).")
-    c3, c4, c5 = st.columns(3)
+    c3, c4 = st.columns(2)
     types = c3.multiselect("Vehicle type", get_detector().names)
     colors = c4.multiselect("Color", COLOR_NAMES)
-    features = get_analyzer().features
-    feat_names = (list(features.names.values()) if features else []) + ["no_front_plate_seen"]
-    feats = c5.multiselect("Has features", feat_names)
-    df = database.search(con, plate, types, colors, feats, fuzz)
+    df = database.search(con, plate, types, colors, fuzz)
     st.write(f"**{len(df)}** matching sightings")
     if df.empty:
         return
@@ -282,12 +279,11 @@ def search_tab() -> None:
             a, b = st.columns([1, 3])
             if r.crop_path and os.path.exists(r.crop_path):
                 a.image(r.crop_path, width="stretch")
-            feats_txt = ", ".join(json.loads(r.features or "[]")) or "—"
             match = f" · match {r['match']:.0%}" if "match" in r and pd.notna(r.get("match")) else ""
             b.markdown(
                 f"**Plate:** `{r.plate_text or 'unread'}`{match}  \n"
                 f"**Type:** {r.vehicle_type} ({r.det_conf:.0%}) · **Color:** {r.color or '—'} · "
-                f"**Shape:** {r.shape or '—'}  \n**Features:** {feats_txt}  \n"
+                f"**Shape:** {r.shape or '—'}  \n"
                 f"**Camera:** {r.camera_id} · track #{r.track_id} · last seen {r.last_seen}")
 
 
@@ -309,11 +305,10 @@ def models_tab() -> None:
     st.markdown(f"""
 | Stage | Model | Status |
 |---|---|---|
-| Vehicle detection | `vehicle_det_fp16.onnx` (YOLO11m) | ✅ {', '.join(det.names)} · {det.session.get_providers()[0]} |
-| Features | `best.pt` (YOLOv8n) | {'✅ ' + ', '.join(an.features.names.values()) if an.features else '❌ ' + an.errors.get('features', '')} |
-| Plate detection + OCR | fast-alpr: `{config.ALPR_DETECTOR}` + `{config.ALPR_OCR}` (ONNX) | {'✅' if an.alpr else '❌ ' + an.errors.get('fast-alpr', '') + ' (falling back to best.pt / RapidOCR)'} |
+| Vehicle detection | `{det.model_file}` | ✅ {', '.join(det.names)} · {det.backend} |
+| Plate detection + OCR | fast-alpr: `{config.ALPR_DETECTOR}` + `{config.ALPR_OCR}` (ONNX) | {'✅' if an.alpr else '❌ ' + an.errors.get('fast-alpr', '') + ' (falling back to RapidOCR)'} |
 | Plate OCR fallback | RapidOCR (PaddleOCR on ONNX) + Pillow cleaning | {'✅' if an.plates else '❌ ' + an.errors.get('ocr', '')} |
-| Two-wheeler detector | `plateReader.pt` (COCO YOLOv8n: bicycle + motorcycle) | {'✅ active, adds bikes the main model misses' if get_two_wheeler_detector() else '❌ unavailable'} |
+| Two-wheeler detector | `plateReader.pt` (COCO YOLOv8n: bicycle + motorcycle) | {'✅ active, adds bikes the main model misses' if get_two_wheeler_detector() else ('⏸ off: all vehicles come from ' + det.model_file if not config.USE_TWO_WHEELER_DETECTOR else '❌ unavailable')} |
 | Color | Pillow Shades-of-Gray + HSV voting | ✅ heuristic (no colour model delivered) |
 | Shape | Box geometry + vehicle class | ✅ heuristic |
 | Tracking | IoU tracker + per-track majority votes | ✅ |

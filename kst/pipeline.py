@@ -1,8 +1,8 @@
 """Orchestrates the cascade for one camera stream:
 
-  frame -> VehicleDetector (ONNX) + TwoWheelerDetector (COCO two-wheelers) -> tracker
+  frame -> VehicleDetector (yollo-world.pt; optional COCO two-wheeler pass, off) -> tracker
         -> reading zone (READING_ZONE, bottom 60% of frame height):
-             crossing = count + analyse (best.pt features, fast-alpr plate box + OCR with
+             crossing = count + analyse (fast-alpr plate box + OCR with
              RapidOCR fallback, Pillow colour, box-geometry shape), re-analysed a few
              times while near the line
         -> per-track majority votes -> SQLite (only vehicles that entered the zone)
@@ -26,7 +26,7 @@ from .vehicle_analysis import VehicleAnalyzer
 from .vehicle_detection import Detection, VehicleDetector, merge_two_wheelers
 
 # Columns of the "vehicles that entered the reading zone" table (live and final).
-ZONE_TABLE_COLUMNS = ["ID", "Type", "Conf", "Plate", "Color", "Shape", "Features",
+ZONE_TABLE_COLUMNS = ["ID", "Type", "Conf", "Plate", "Color", "Shape",
                       "Entered zone", "In zone", "Frame", "First seen", "Last seen"]
 
 
@@ -35,7 +35,6 @@ class TrackState:
     plates: Counter = field(default_factory=Counter)
     plate_best: dict = field(default_factory=dict)     # text -> best conf
     colors: Counter = field(default_factory=Counter)
-    features: Counter = field(default_factory=Counter)
     shape: str | None = None
     best_sharp: float = -1.0
     analyses: int = 0
@@ -50,17 +49,12 @@ class TrackState:
         plate = self.plates.most_common(1)[0][0] if self.plates else None
         color = self.colors.most_common(1)[0][0] if self.colors else None
         total_c = sum(self.colors.values()) or 1
-        need = max(1, self.analyses // 3)      # feature must recur to be reported
-        feats = sorted(f for f, n in self.features.items() if n >= need)
-        if "front_plate" in feats:
-            feats = [f for f in feats if f != "no_front_plate_seen"]
         return {
             "plate_text": plate,
             "plate_conf": self.plate_best.get(plate),
             "color": color,
             "color_conf": (self.colors[color] / total_c) if color else None,
             "shape": self.shape,
-            "features": feats,
             "in_zone": self.in_zone,
             "crossed": self.crossed,
             "entered_this_frame": self.entered_this_frame,
@@ -91,7 +85,7 @@ class Pipeline:
             dets = merge_two_wheelers(dets, self.two_wheeler_detector(frame))
         return dets
 
-    def process(self, frame: np.ndarray, vehicle_conf: float, feat_conf: float,
+    def process(self, frame: np.ndarray, vehicle_conf: float,
                 plate_conf: float) -> list[Detection]:
         self.frame_no += 1
         H = frame.shape[0]
@@ -121,7 +115,7 @@ class Pipeline:
         due.sort(key=lambda t: (t[0], t[1]))      # never-analysed and biggest first
         for _, _, d in due[:config.ANALYSES_PER_FRAME]:
             x1, y1, x2, y2 = d.box
-            self._analyze(d, self.states[d.track_id], frame[y1:y2, x1:x2], feat_conf, plate_conf,
+            self._analyze(d, self.states[d.track_id], frame[y1:y2, x1:x2], plate_conf,
                           frame.shape)
         for d in dets:
             d.info = self.states[d.track_id].summary()
@@ -148,7 +142,6 @@ class Pipeline:
                 "Plate": i.get("plate_text") or "",
                 "Color": i.get("color") or "",
                 "Shape": i.get("shape") or "",
-                "Features": ", ".join(f for f in i.get("features", []) if f != "no_front_plate_seen"),
                 "Entered zone": bool(i.get("crossed")),
                 "In zone": bool(i.get("in_zone")),
                 "Frame": self.frame_no,
@@ -159,30 +152,28 @@ class Pipeline:
         return pd.DataFrame(list(self.seen.values()), columns=ZONE_TABLE_COLUMNS).sort_values(
             "ID", ascending=False)
 
-    def process_photo(self, frame: np.ndarray, vehicle_conf: float, feat_conf: float,
+    def process_photo(self, frame: np.ndarray, vehicle_conf: float,
                       plate_conf: float) -> list[Detection]:
         """Single image: no line, analyse every detected vehicle once."""
         dets = self.tracker.update(self.detect(frame, vehicle_conf), 1)
         for d in dets:
             x1, y1, x2, y2 = d.box
             if min(x2 - x1, y2 - y1) >= 8:
-                self._analyze(d, self.states[d.track_id], frame[y1:y2, x1:x2], feat_conf, plate_conf)
+                self._analyze(d, self.states[d.track_id], frame[y1:y2, x1:x2], plate_conf)
             d.info = self.states[d.track_id].summary()
         return dets
 
-    def analyze_whole_image(self, frame: np.ndarray, feat_conf: float, plate_conf: float) -> Detection:
+    def analyze_whole_image(self, frame: np.ndarray, plate_conf: float) -> Detection:
         """Treat the full image as one vehicle (close-up photos the detector misses)."""
         h, w = frame.shape[:2]
         d = Detection((0, 0, w, h), "car", 0.0, track_id=self.tracker.next_id)
         self.tracker.next_id += 1
-        self._analyze(d, self.states[d.track_id], frame, feat_conf, plate_conf)
+        self._analyze(d, self.states[d.track_id], frame, plate_conf)
         d.info = self.states[d.track_id].summary()
         return d
 
-    def _analyze(self, d: Detection, st: TrackState, crop, feat_conf, plate_conf, frame_shape=None):
-        info = self.analyzer.analyze(crop, feat_conf, plate_conf, d.class_name)
-        if d.class_name == "motorcycle":   # windshield tint is meaningless on a bike
-            info.features = [f for f in info.features if f != "tinted_windshield"]
+    def _analyze(self, d: Detection, st: TrackState, crop, plate_conf, frame_shape=None):
+        info = self.analyzer.analyze(crop, plate_conf, d.class_name)
         if info.plate_box is not None and frame_shape is not None:
             # drop plate boxes that sit on burned-in camera text
             px = d.box[0] + (info.plate_box[0] + info.plate_box[2]) / 2
@@ -191,15 +182,12 @@ class Pipeline:
             if any(mx1 * W <= px <= mx2 * W and my1 * H <= py <= my2 * H
                    for mx1, my1, mx2, my2 in config.OSD_MASKS):
                 info.plate_box, info.plate_text = None, None
-                info.features = [f for f in info.features if f != "front_plate"]
         if info.plate_box is not None:
             ch, cw = crop.shape[:2]
             b = info.plate_box
             st.plate_rel = (b[0] / cw, b[1] / ch, b[2] / cw, b[3] / ch)
             st.plate_src = info.plate_source
         st.analyses += 1
-        for f in info.features:
-            st.features[f] += 1
         if info.plate_text:
             st.plates[info.plate_text] += 1
             st.plate_best[info.plate_text] = max(st.plate_best.get(info.plate_text, 0), info.plate_conf)

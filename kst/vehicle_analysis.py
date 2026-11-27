@@ -1,13 +1,11 @@
 """Stage 2: per-vehicle analysis on each crop.
 
-  * FeatureDetector  - best.pt (YOLOv8n): tinted_windshield, police_revolving_light, front_plate
   * Plates           - see plate_reading.py (fast-alpr first, RapidOCR fallback)
   * Colour / shape   - see appearance.py (called from pipeline.py)
 """
 from __future__ import annotations
 
-import shutil
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 from PIL import Image
@@ -18,35 +16,12 @@ from .plate_reading import (FastAlprPlateReader, RapidOcrPlateReader, find_plate
                             has_plate_background, is_plate_shaped, plate_position_score)
 
 
-def _ensure_feature_weights():
-    if not config.FEATURE_MODEL.exists() and config.FEATURE_MODEL_ZIP.exists():
-        shutil.copyfile(config.FEATURE_MODEL_ZIP, config.FEATURE_MODEL)
-    return config.FEATURE_MODEL
-
-
 @dataclass
 class VehicleInfo:
-    features: list[str] = field(default_factory=list)
     plate_text: str | None = None
     plate_conf: float | None = None
     plate_box: tuple | None = None                              # crop coords
     plate_source: str | None = None                             # which locator found it
-
-
-class FeatureDetector:
-    def __init__(self):
-        from ultralytics import YOLO
-        self.model = YOLO(str(_ensure_feature_weights()))
-        self.names = self.model.names
-
-    def __call__(self, crop: Image.Image, conf: float):
-        imgsz = 320 if max(crop.size) <= 400 else 640   # crops are small; 320 is ~4x cheaper
-        r = self.model.predict(crop, conf=conf, imgsz=imgsz, verbose=False)[0]
-        out = []
-        for b in r.boxes:
-            x1, y1, x2, y2 = (int(v) for v in b.xyxy[0].tolist())
-            out.append((self.names[int(b.cls)], float(b.conf), x1, y1, x2, y2))
-        return out
 
 
 class VehicleAnalyzer:
@@ -54,7 +29,6 @@ class VehicleAnalyzer:
 
     def __init__(self):
         self.errors: dict[str, str] = {}
-        self.features = self._try("features", FeatureDetector)
         self.alpr = self._try("fast-alpr", FastAlprPlateReader)
         self.plates = self._try("ocr", RapidOcrPlateReader)
 
@@ -65,26 +39,16 @@ class VehicleAnalyzer:
             self.errors[name] = f"{type(e).__name__}: {e}"
             return None
 
-    def analyze(self, crop_bgr: np.ndarray, feat_conf: float, plate_conf: float,
+    def analyze(self, crop_bgr: np.ndarray, plate_conf: float,
                 vehicle_type: str = "car") -> VehicleInfo:
         info = VehicleInfo()
         pil = clean_vehicle_crop(bgr_to_pil(crop_bgr))
-        front_plates = []
-        if self.features:
-            for label, c, *xyxy in self.features(pil, feat_conf):
-                if label == "front_plate":
-                    front_plates.append((c, *xyxy))
-                else:
-                    info.features.append(label)
-
-        box, source = self.locate_plate(crop_bgr, pil, front_plates, vehicle_type)
+        box, source = self.locate_plate(crop_bgr, pil, vehicle_type)
         info.plate_box, info.plate_source = box, source
         if box is not None:
             text, score = self.read_plate(crop_bgr, pil, box)
             if text and score >= plate_conf:
                 info.plate_text, info.plate_conf = text, score
-        info.features.append("front_plate" if box is not None else "no_front_plate_seen")
-        info.features = sorted(set(info.features))
         return info
 
     def read_plate(self, crop_bgr: np.ndarray, pil: Image.Image, box) -> tuple[str | None, float]:
@@ -105,10 +69,10 @@ class VehicleAnalyzer:
                 return text, score
         return None, 0.0
 
-    def locate_plate(self, crop_bgr: np.ndarray, pil: Image.Image, front_plates=(),
+    def locate_plate(self, crop_bgr: np.ndarray, pil: Image.Image,
                      vehicle_type: str = "car") -> tuple[tuple | None, str | None]:
         """Plate box in crop coords. fast-alpr's plate detector when it is loaded; otherwise
-        best.pt's front_plate box, OCR text detection, or a Pillow bright-rectangle search."""
+        OCR text detection, or a Pillow bright-rectangle search."""
         w, h = pil.size
         pad = lambda b: (max(0, b[0] - 3), max(0, b[1] - 3), min(w, b[2] + 3), min(h, b[3] + 3))
         if self.alpr:
@@ -119,10 +83,6 @@ class VehicleAnalyzer:
         # --- fallbacks, only without fast-alpr ---
         # plate search starts this far down the vehicle box (bike boxes include the rider)
         top = int(h * config.PLATE_SEARCH_FROM.get(vehicle_type, 0.45))
-        good = [b for b in front_plates if b[0] >= config.FRONT_PLATE_MIN_CONF
-                and is_plate_shaped(b[1:], w, h) and (b[2] + b[4]) / 2 >= top]
-        if good:
-            return pad(max(good)[1:]), "best.pt"
         lower = pil.crop((0, top, w, h))
         if self.plates:
             texts = [(s, x1, y1 + top, x2, y2 + top) for s, x1, y1, x2, y2 in self.plates.find_text_boxes(lower)]

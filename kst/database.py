@@ -1,7 +1,6 @@
-"""SQLite record store + search (plate fuzzy match and feature filters)."""
+"""SQLite record store + search (plate fuzzy match and type / colour filters)."""
 from __future__ import annotations
 
-import json
 import re
 import sqlite3
 from datetime import datetime, timezone
@@ -64,9 +63,9 @@ def upsert(con: sqlite3.Connection, run_id: str, camera_id: str, rec: dict) -> N
     con.execute(
         """
         INSERT INTO sightings (run_id, camera_id, track_id, vehicle_type, det_conf,
-            plate_text, plate_norm, plate_conf, color, color_conf, shape, features,
+            plate_text, plate_norm, plate_conf, color, color_conf, shape,
             crop_path, first_seen, last_seen)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(run_id, track_id) DO UPDATE SET
             vehicle_type=excluded.vehicle_type,
             det_conf=MAX(det_conf, excluded.det_conf),
@@ -76,14 +75,13 @@ def upsert(con: sqlite3.Connection, run_id: str, camera_id: str, rec: dict) -> N
             color=COALESCE(excluded.color, color),
             color_conf=COALESCE(excluded.color_conf, color_conf),
             shape=COALESCE(excluded.shape, shape),
-            features=excluded.features,
             crop_path=COALESCE(excluded.crop_path, crop_path),
             last_seen=excluded.last_seen
         """,
         (run_id, camera_id, rec["track_id"], rec["vehicle_type"], rec["det_conf"],
          rec.get("plate_text"), normalize_plate(rec.get("plate_text")) or None,
          rec.get("plate_conf"), rec.get("color"), rec.get("color_conf"), rec.get("shape"),
-         json.dumps(rec.get("features", [])), rec.get("crop_path"), ts, ts),
+         rec.get("crop_path"), ts, ts),
     )
     con.commit()
 
@@ -93,7 +91,7 @@ def all_records(con: sqlite3.Connection) -> pd.DataFrame:
 
 
 def search(con: sqlite3.Connection, plate: str = "", vehicle_types=(), colors=(),
-           features=(), min_score: float = 0.6) -> pd.DataFrame:
+           min_score: float = 0.6) -> pd.DataFrame:
     df = all_records(con)
     if df.empty:
         return df
@@ -101,9 +99,6 @@ def search(con: sqlite3.Connection, plate: str = "", vehicle_types=(), colors=()
         df = df[df.vehicle_type.isin(vehicle_types)]
     if colors:
         df = df[df.color.isin(colors)]
-    if features:
-        wanted = set(features)
-        df = df[df.features.apply(lambda f: wanted.issubset(json.loads(f or "[]")))]
     if plate.strip():
         q = _fuzzy_key(plate)
 
