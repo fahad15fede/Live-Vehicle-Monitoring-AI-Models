@@ -18,7 +18,7 @@ import cv2
 import numpy as np
 import pandas as pd
 
-from . import config, database
+from . import config, database, device
 from .appearance import estimate_color, estimate_shape
 from .image_utils import bgr_to_pil, sharpness
 from .tracking import IoUTracker
@@ -113,7 +113,8 @@ class Pipeline:
             if in_zone and big and st.analyses < config.MAX_ANALYSES_PER_TRACK:
                 due.append((st.analyses, -(x2 - x1) * (y2 - y1), d))
         due.sort(key=lambda t: (t[0], t[1]))      # never-analysed and biggest first
-        for _, _, d in due[:config.ANALYSES_PER_FRAME]:
+        budget = config.ANALYSES_PER_FRAME_GPU if device.USE_CUDA else config.ANALYSES_PER_FRAME
+        for _, _, d in due[:budget]:
             x1, y1, x2, y2 = d.box
             self._analyze(d, self.states[d.track_id], frame[y1:y2, x1:x2], plate_conf,
                           frame.shape)

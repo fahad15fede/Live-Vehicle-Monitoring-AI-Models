@@ -2,14 +2,15 @@
 
 All model logic lives in the `kst` package; this file is UI only.
 Run:  python -m streamlit run app.py
+
+Live runs: capture thread -> GPU inference thread (kst.live.LiveRunner) -> this UI, which
+only displays the newest result, so the page never blocks on inference.
 """
 from __future__ import annotations
 
 import os
 import tempfile
-import time
 import zipfile
-from collections import Counter
 from pathlib import Path
 
 import cv2
@@ -18,10 +19,12 @@ import pandas as pd
 import streamlit as st
 from PIL import Image
 
-from kst import config, database
+from kst import config, database, device
 from kst.appearance import COLOR_NAMES
+from kst.live import LiveRunner
 from kst.overlay import draw_detections
 from kst.pipeline import ZONE_TABLE_COLUMNS, Pipeline
+from kst.stream import FileCapture, LiveCapture
 from kst.vehicle_analysis import VehicleAnalyzer
 from kst.vehicle_detection import TwoWheelerDetector, VehicleDetector
 
@@ -60,16 +63,18 @@ def get_db():
     return database.connect()
 
 
-def new_pipeline(cam_id: str) -> Pipeline:
-    return Pipeline(get_detector(), get_analyzer(), get_db(), cam_id,
+def new_pipeline(cam_id: str, con=None) -> Pipeline:
+    return Pipeline(get_detector(), get_analyzer(), con or get_db(), cam_id,
                     two_wheeler_detector=get_two_wheeler_detector())
 
 
 # ---------------------------------------------------------------- stream control
 def stop_stream() -> None:
-    cap = st.session_state.pop("cap", None)
-    if cap is not None:
-        cap.release()
+    runner = st.session_state.pop("runner", None)
+    if runner is not None:
+        runner.stop()
+        runner.source.release()
+        runner.pipeline.con.close()
     tmp = st.session_state.pop("tmp_path", None)
     if tmp and os.path.exists(tmp):
         try:
@@ -87,61 +92,46 @@ def _tmp_video(data: bytes, suffix: str) -> str:
     return path
 
 
-def start_stream(kind: str, cam_index: int, rtsp: str, upload) -> None:
+def start_stream(kind: str, cam_index: int, rtsp: str, upload, p: dict) -> None:
     stop_stream()
+    get_detector(), get_analyzer()                # load + warm up models before the clock starts
     if kind == "Webcam":
-        cap, cam_id = cv2.VideoCapture(cam_index, cv2.CAP_DSHOW), f"CAM-{cam_index}"
+        src, cam_id = LiveCapture(cam_index), f"CAM-{cam_index}"
     elif kind == "RTSP / IP camera":
         if not rtsp.strip():
             st.error("Enter an RTSP URL first.")
             return
-        cap, cam_id = cv2.VideoCapture(rtsp.strip()), "KHI-RTSP-01"
+        # returns at once; connecting runs in the background (status shown in the live view)
+        src, cam_id = LiveCapture(rtsp.strip()), "KHI-RTSP-01"
     elif kind == "Upload video":
         if upload is None:
             st.error("Choose a video file first.")
             return
-        cap = cv2.VideoCapture(_tmp_video(upload.getvalue(), Path(upload.name).suffix or ".mp4"))
+        src = FileCapture(_tmp_video(upload.getvalue(), Path(upload.name).suffix or ".mp4"), p["skip"])
         cam_id = "KHI-UPLOAD-01"
     else:
         with zipfile.ZipFile(config.DEMO_ARCHIVE) as z:
-            cap = cv2.VideoCapture(_tmp_video(z.read(config.DEMO_VIDEO_MEMBER), ".mp4"))
+            src = FileCapture(_tmp_video(z.read(config.DEMO_VIDEO_MEMBER), ".mp4"), p["skip"])
         cam_id = "KHI-DEMO-01"
-    if not cap.isOpened():
-        st.error("Could not open the source. Check the camera index / URL / file.")
-        cap.release()
+    if not src.isOpened():
+        st.error("Could not open the video file.")
+        src.release()
         return
-    if kind == "Webcam":
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)    # always show the newest camera frame
-    st.session_state.cap = cap
-    st.session_state.is_file = kind in ("Upload video", "Included demo video")
-    st.session_state.src_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    st.session_state.total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    st.session_state.pipeline = new_pipeline(cam_id)
+    # The worker gets its own DB connection: sqlite connections are not safe across threads.
+    runner = LiveRunner(src, new_pipeline(cam_id, database.connect()),
+                        p["vehicle_conf"], p["plate_conf"])
+    runner.start()
+    st.session_state.runner = runner
     st.session_state.finished = None
-    st.session_state.analysed_frames = 0
     st.session_state.running = True
 
 
-def read_frame(skip: int):
-    """Analyse one frame, then drop the next `skip` frames (any source).
-    The first frame of a run is read without skipping. Files are played once."""
-    cap = st.session_state.cap
-    if st.session_state.get("analysed_frames", 0) > 0:
-        for _ in range(skip):
-            if not cap.grab():
-                return None
-    ok, frame = cap.read()
-    if not ok:
-        return None
-    st.session_state.analysed_frames = st.session_state.get("analysed_frames", 0) + 1
-    return frame
-
-
 def finish_stream(reason: str) -> None:
-    pl = st.session_state.pipeline
-    st.session_state.finished = {"reason": reason, "counts": dict(pl.counts),
-                                 "tracks": pl.tracker.next_id - 1, "camera": pl.camera_id,
-                                 "rows": pl.seen_table().to_dict("records")}
+    runner = st.session_state.runner
+    snap = runner.snapshot()
+    st.session_state.finished = {"reason": reason, "counts": snap.counts, "tracks": snap.tracks,
+                                 "camera": runner.pipeline.camera_id, "rows": snap.rows,
+                                 "error": runner.error or getattr(runner.source, "error", None)}
     stop_stream()
 
 
@@ -149,20 +139,18 @@ def finish_stream(reason: str) -> None:
 def sidebar() -> dict:
     with st.sidebar:
         st.header("🚦 Karachi Smart Traffic AI")
+        st.caption(f"Compute: **{device.summary()}**")
         kind = st.radio("Source", ["Webcam", "RTSP / IP camera", "Upload video", "Included demo video"])
         cam_index = st.number_input("Webcam index", 0, 10, 0) if kind == "Webcam" else 0
         rtsp = st.text_input("RTSP URL", placeholder="rtsp://user:pass@ip:554/stream") \
             if kind == "RTSP / IP camera" else ""
         upload = st.file_uploader("Video", type=["mp4", "avi", "mov", "mkv"]) \
             if kind == "Upload video" else None
-        skip = st.slider("Frames to skip after each analysed frame", 0, 30, config.DEFAULT_SKIP_FRAMES,
+        default_skip = config.DEFAULT_SKIP_FRAMES_GPU if device.USE_CUDA else config.DEFAULT_SKIP_FRAMES
+        skip = st.slider("Video files: frames to skip after each analysed frame", 0, 30, default_skip,
                          help="Analyse 1 frame, skip this many, analyse the next. "
-                              "5 = frames 1, 7, 13, 19 ... are analysed.")
-        c1, c2 = st.columns(2)
-        if c1.button("▶ Start", type="primary", width="stretch"):
-            start_stream(kind, int(cam_index), rtsp, upload)
-        if c2.button("■ Stop", width="stretch") and st.session_state.get("running"):
-            finish_stream("Stopped by operator")
+                              "Live cameras always analyse the newest frame instead.") \
+            if kind in ("Upload video", "Included demo video") else 0
 
         st.subheader("Confidence thresholds")
         st.caption("Kept low on purpose: recall over precision. Raise to cut noise.")
@@ -171,13 +159,29 @@ def sidebar() -> dict:
             "vehicle_conf": st.slider("Vehicle", 0.05, 0.9, config.VEHICLE_CONF, 0.05),
             "plate_conf": st.slider("Plate OCR", 0.05, 0.9, config.PLATE_CONF, 0.05),
         }
+        c1, c2 = st.columns(2)
+        if c1.button("▶ Start", type="primary", width="stretch"):
+            start_stream(kind, int(cam_index), rtsp, upload, p)
+        if c2.button("■ Stop", width="stretch") and st.session_state.get("running"):
+            finish_stream("Stopped by operator")
+    runner = st.session_state.get("runner")
+    if runner is not None:                        # slider changes apply to the running worker
+        runner.vehicle_conf, runner.plate_conf = p["vehicle_conf"], p["plate_conf"]
     return p
 
 
-def live_tab(p: dict) -> None:
+def live_tab() -> None:
+    # The auto-refreshing fragments are module-level and rendered on EVERY run (they draw
+    # nothing when idle). Defining them conditionally made Streamlit log
+    # "The fragment with id ... does not exist anymore" after each full rerun.
     if not st.session_state.get("running"):
         done = st.session_state.get("finished")
-        if done:
+        if done and done.get("error") and not done["tracks"]:
+            # failed before anything was processed: one error box, no empty results
+            st.error(f"**{done['reason']}** · {done['camera']}  \n{done['error']}")
+        elif done:
+            if done.get("error"):
+                st.error(f"**{done['reason']}** · {done['camera']}  \n{done['error']}")
             st.success(f"**{done['reason']}** · {done['camera']} · "
                        f"{sum(done['counts'].values())} vehicles passed the reading zone "
                        f"({done['tracks']} tracked in total). Results are in **Search** / **Records**.")
@@ -188,51 +192,56 @@ def live_tab(p: dict) -> None:
             st.info("Choose a source in the sidebar and press **Start**. Vehicles are counted, "
                     "and their plate and colour are read, inside the reading zone "
                     f"({config.READING_ZONE[0]:.0%}-{config.READING_ZONE[1]:.0%} of the frame height).")
-        return
-
-    @st.fragment(run_every=0.1)
-    def loop():
-        if not st.session_state.get("running"):
-            return
-        frame = read_frame(p["skip"])
-        if frame is None:
-            finish_stream("Video finished" if st.session_state.is_file else "Camera signal lost")
-            st.rerun()
-        pl = st.session_state.pipeline
-        t0 = time.time()
-        dets = pl.process(frame, p["vehicle_conf"], p["plate_conf"])
-        dt = time.time() - t0
-        left, right = st.columns([3, 1.3])
-        caption = (f"{pl.camera_id} · analysed frame #{st.session_state.analysed_frames} "
-                   f"(1 analysed, {p['skip']} skipped) · {dt*1000:.0f} ms")
-        if st.session_state.is_file and st.session_state.total_frames:
-            pos = int(st.session_state.cap.get(cv2.CAP_PROP_POS_FRAMES))
-            left.progress(min(1.0, pos / st.session_state.total_frames))
-            caption += f" · frame {pos}/{st.session_state.total_frames}"
-        left.image(draw_detections(frame, dets, pl.zone, pl.counts), channels="BGR",
-                   width="stretch", caption=caption)
-        with right:
-            a, b, c = st.columns(3)
-            a.metric("In frame", len(dets))
-            b.metric("Zone vehicles", len(pl.seen))
-            c.metric("Read in zone", sum(pl.counts.values()))
-            type_counts = Counter(r["Type"] for r in pl.seen.values())
-            if type_counts:
-                st.caption(" · ".join(f"**{k}** {v}" for k, v in type_counts.most_common()))
-    loop()
+    live_view()
     zone_entries_table()
 
 
-@st.fragment(run_every=0.2)
-def zone_entries_table() -> None:
-    if not st.session_state.get("running"):
+@st.fragment(run_every=1 / config.DISPLAY_FPS)
+def live_view() -> None:
+    runner = st.session_state.get("runner")
+    if runner is None:
         return
-    pl = st.session_state.pipeline
-    df = pl.seen_table().reset_index(drop=True)
+    if runner.finished:
+        finish_stream(runner.done_reason)
+        st.rerun()                                # full rerun: show the results
+    snap = runner.snapshot()
+    if snap.jpeg is None:
+        st.info(snap.status)
+        return
+    left, right = st.columns([3, 1.3])
+    src = runner.source
+    caption = (f"{runner.pipeline.camera_id} · analysed frame #{snap.frame_no} · "
+               f"{snap.fps:.1f} FPS · inference {snap.infer_ms:.0f} ms")
+    caption += f" · 1 analysed, {src.skip} skipped" if src.is_file else " · live: newest frame"
+    if snap.status != "Running":
+        caption += f" · {snap.status}"
+    if snap.progress:
+        pos, total = snap.progress
+        left.progress(min(1.0, pos / total))
+        caption += f" · frame {pos}/{total}"
+    left.image(snap.jpeg, width="stretch", caption=caption)
+    with right:
+        a, b, c = st.columns(3)
+        a.metric("In frame", snap.in_frame)
+        b.metric("Zone vehicles", snap.zone_vehicles)
+        c.metric("Read in zone", snap.read_in_zone)
+        if snap.type_counts:
+            st.caption(" · ".join(f"**{k}** {v}" for k, v in snap.type_counts.most_common()))
+        st.caption(f"Compute: {device.summary()}"
+                   + (" · HW video decode" if getattr(src, "hw", False) else ""))
+
+
+@st.fragment(run_every=0.5)
+def zone_entries_table() -> None:
+    runner = st.session_state.get("runner")
+    if runner is None:
+        return
+    snap = runner.snapshot()
+    df = pd.DataFrame(snap.rows, columns=ZONE_TABLE_COLUMNS)
     st.subheader(f"Reading-zone vehicle entries ({len(df)})")
-    st.caption(f"Updated through analyzed frame {pl.frame_no}.")
+    st.caption(f"Updated through analysed frame {snap.frame_no}.")
     st.dataframe(df, hide_index=True, width="stretch", height=360,
-                 key=f"live_zone_entries_{pl.run_id}", column_config=ZONE_TABLE_CONFIG)
+                 key=f"live_zone_entries_{runner.pipeline.run_id}", column_config=ZONE_TABLE_CONFIG)
 
 
 def all_frames_table(rows: list[dict]) -> None:
@@ -302,12 +311,16 @@ def records_tab() -> None:
 
 def models_tab() -> None:
     det, an = get_detector(), get_analyzer()
+    prov = an.providers()
+    st.caption(f"Compute device: **{device.summary()}** · ONNX Runtime providers: "
+               f"`{[p[0] if isinstance(p, tuple) else p for p in device.ort_providers()]}` "
+               "(set `KST_DEVICE=cpu` to force CPU)")
     st.markdown(f"""
 | Stage | Model | Status |
 |---|---|---|
 | Vehicle detection | `{det.model_file}` | ✅ {', '.join(det.names)} · {det.backend} |
-| Plate detection + OCR | fast-alpr: `{config.ALPR_DETECTOR}` + `{config.ALPR_OCR}` (ONNX) | {'✅' if an.alpr else '❌ ' + an.errors.get('fast-alpr', '') + ' (falling back to RapidOCR)'} |
-| Plate OCR fallback | RapidOCR (PaddleOCR on ONNX) + Pillow cleaning | {'✅' if an.plates else '❌ ' + an.errors.get('ocr', '')} |
+| Plate detection + OCR | fast-alpr: `{config.ALPR_DETECTOR}` + `{config.ALPR_OCR}` (ONNX) | {'✅ ' + prov.get('plate detector', '?') + ' / ' + prov.get('plate OCR', '?') if an.alpr else '❌ ' + an.errors.get('fast-alpr', '') + ' (falling back to RapidOCR)'} |
+| Plate OCR fallback | RapidOCR (PaddleOCR on ONNX) + Pillow cleaning | {'✅ ' + prov.get('RapidOCR', '?') if an.plates else '❌ ' + an.errors.get('ocr', '')} |
 | Two-wheeler detector | `plateReader.pt` (COCO YOLOv8n: bicycle + motorcycle) | {'✅ active, adds bikes the main model misses' if get_two_wheeler_detector() else ('⏸ off: all vehicles come from ' + det.model_file if not config.USE_TWO_WHEELER_DETECTOR else '❌ unavailable')} |
 | Color | Pillow Shades-of-Gray + HSV voting | ✅ heuristic (no colour model delivered) |
 | Shape | Box geometry + vehicle class | ✅ heuristic |
@@ -320,7 +333,7 @@ def main() -> None:
     p = sidebar()
     tabs = st.tabs(["📹 Live monitor", "🖼️ Photo check", "🔎 Search", "🗂️ Records", "🧠 Models"])
     with tabs[0]:
-        live_tab(p)
+        live_tab()
     with tabs[1]:
         image_tab(p)
     with tabs[2]:

@@ -54,6 +54,8 @@ def connect() -> sqlite3.Connection:
     config.DATA_DIR.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(config.DATABASE_PATH, check_same_thread=False)
     con.row_factory = sqlite3.Row
+    con.execute("PRAGMA journal_mode=WAL")      # live worker writes while the UI reads
+    con.execute("PRAGMA busy_timeout=5000")
     con.executescript(SCHEMA)
     return con
 

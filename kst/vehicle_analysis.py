@@ -5,12 +5,13 @@
 """
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 
 import numpy as np
 from PIL import Image
 
-from . import config
+from . import config, device
 from .image_utils import bgr_to_pil, clean_vehicle_crop
 from .plate_reading import (FastAlprPlateReader, RapidOcrPlateReader, find_plate_blob,
                             has_plate_background, is_plate_shaped, plate_position_score)
@@ -29,8 +30,19 @@ class VehicleAnalyzer:
 
     def __init__(self):
         self.errors: dict[str, str] = {}
+        self._lock = threading.Lock()          # live worker + photo tab share these models
         self.alpr = self._try("fast-alpr", FastAlprPlateReader)
         self.plates = self._try("ocr", RapidOcrPlateReader)
+
+    def providers(self) -> dict[str, str]:
+        """Execution provider each plate model actually runs on (CUDA / CPU)."""
+        out = {}
+        for name, obj in (("plate detector", self.alpr and self.alpr.detector),
+                          ("plate OCR", self.alpr and self.alpr.ocr), ("RapidOCR", self.plates)):
+            if obj:
+                p = device.session_providers(obj)
+                out[name] = p[0].replace("ExecutionProvider", "") if p else "?"
+        return out
 
     def _try(self, name, factory):
         try:
@@ -41,6 +53,10 @@ class VehicleAnalyzer:
 
     def analyze(self, crop_bgr: np.ndarray, plate_conf: float,
                 vehicle_type: str = "car") -> VehicleInfo:
+        with self._lock:
+            return self._analyze(crop_bgr, plate_conf, vehicle_type)
+
+    def _analyze(self, crop_bgr: np.ndarray, plate_conf: float, vehicle_type: str) -> VehicleInfo:
         info = VehicleInfo()
         pil = clean_vehicle_crop(bgr_to_pil(crop_bgr))
         box, source = self.locate_plate(crop_bgr, pil, vehicle_type)

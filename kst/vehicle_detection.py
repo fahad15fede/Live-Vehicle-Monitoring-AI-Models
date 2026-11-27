@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import ast
+import threading
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -14,7 +15,7 @@ import cv2
 import numpy as np
 import onnxruntime as ort
 
-from . import config
+from . import config, device
 
 
 @dataclass
@@ -43,23 +44,29 @@ def _iou_many(b: np.ndarray, bs: np.ndarray) -> np.ndarray:
     return inter / np.maximum(area - inter, 1e-6)
 
 
+def _warmup(model, imgsz: int) -> None:
+    """Dummy passes so CUDA/cuDNN kernel selection happens at load time, not on frame 1."""
+    blank = np.zeros((imgsz, imgsz, 3), np.uint8)
+    for _ in range(2):
+        model.predict(blank, imgsz=imgsz, device=device.TORCH_DEVICE, quantize=device.QUANTIZE, verbose=False)
+
+
 class VehicleDetector:
     def __init__(self, path=config.VEHICLE_MODEL):
         self.yolo = None
         self.model_file = config.Path(path).name
+        self._lock = threading.Lock()          # live worker + photo tab share this model
         if str(path).endswith(".pt"):          # Ultralytics checkpoint (YOLO / YOLO-World)
             from ultralytics import YOLO
             self.yolo = YOLO(str(path))
             # Normalise names so the rest of the pipeline sees e.g. "auto_rickshaw".
             self.names = [str(self.yolo.names[i]).strip().replace(" ", "_")
                           for i in sorted(self.yolo.names)]
-            import torch
             arch = type(self.yolo.model).__name__.replace("Model", "")   # e.g. "World"
-            self.backend = f"Ultralytics {arch} · {'CUDA' if torch.cuda.is_available() else 'CPU'}"
+            self.backend = f"Ultralytics {arch} · {device.summary()}"
+            _warmup(self.yolo, config.DETECT_IMGSZ)
             return
-        providers = [p for p in ("CUDAExecutionProvider", "CPUExecutionProvider")
-                     if p in ort.get_available_providers()]
-        self.session = ort.InferenceSession(str(path), providers=providers)
+        self.session = ort.InferenceSession(str(path), providers=device.ort_providers())
         self.backend = f"ONNX · {self.session.get_providers()[0]}"
         inp = self.session.get_inputs()[0]
         self.input_name = inp.name
@@ -81,8 +88,9 @@ class VehicleDetector:
 
     def _predict_pt(self, frame: np.ndarray, conf: float) -> list[Detection]:
         floors = [min(conf, config.CLASS_CONF_FLOOR.get(n, conf)) for n in self.names]
-        r = self.yolo.predict(frame, conf=min(floors), iou=config.NMS_IOU, imgsz=640,
-                              agnostic_nms=True, verbose=False)[0]
+        r = self.yolo.predict(frame, conf=min(floors), iou=config.NMS_IOU,
+                              imgsz=config.DETECT_IMGSZ, agnostic_nms=True,
+                              device=device.TORCH_DEVICE, quantize=device.QUANTIZE, verbose=False)[0]
         out = []
         for b in r.boxes:
             c, score = int(b.cls), float(b.conf)
@@ -93,8 +101,12 @@ class VehicleDetector:
         return out
 
     def __call__(self, frame: np.ndarray, conf: float = config.VEHICLE_CONF) -> list[Detection]:
-        if self.yolo is not None:
-            return self._predict_pt(frame, conf)
+        with self._lock:
+            if self.yolo is not None:
+                return self._predict_pt(frame, conf)
+            return self._predict_onnx(frame, conf)
+
+    def _predict_onnx(self, frame: np.ndarray, conf: float) -> list[Detection]:
         img, s, px, py = self._letterbox(frame)
         t = np.ascontiguousarray(img[:, :, ::-1].transpose(2, 0, 1)[None], np.float32) / 255.0
         if self.fp16:
@@ -147,12 +159,16 @@ class TwoWheelerDetector:
         names = {int(k): str(v) for k, v in self.model.names.items()}
         if names.get(3) != "motorcycle":
             raise ValueError("plateReader.pt is no longer the COCO model; two-wheeler detector disabled")
+        self._lock = threading.Lock()
+        _warmup(self.model, config.DETECT_IMGSZ)
 
     def __call__(self, frame: np.ndarray, conf: float = config.TWO_WHEELER_CONF) -> list[Detection]:
         """Two-wheelers, with rider fusion: a weak bike box (>= 0.08) that touches a person
         box becomes one 'motorcycle + rider' box. Lone bikes need `conf`; lone people are ignored."""
-        r = self.model.predict(frame, conf=0.08, classes=[0, *self.COCO_TWO_WHEELERS],
-                               imgsz=640, verbose=False)[0]
+        with self._lock:
+            r = self.model.predict(frame, conf=0.08, classes=[0, *self.COCO_TWO_WHEELERS],
+                                   imgsz=config.DETECT_IMGSZ, device=device.TORCH_DEVICE,
+                                   quantize=device.QUANTIZE, verbose=False)[0]
         people, bikes = [], []
         for b in r.boxes:
             box, c = tuple(int(v) for v in b.xyxy[0].tolist()), float(b.conf)

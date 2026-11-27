@@ -14,7 +14,7 @@ import cv2
 import numpy as np
 from PIL import Image, ImageFilter
 
-from . import config
+from . import config, device
 from .image_utils import clean_plate_crop, pil_to_bgr
 
 # Loose Pakistani plate pattern: 2-3 letters, optional year/dash, 2-4 digits.
@@ -32,9 +32,20 @@ class FastAlprPlateReader:
     def __init__(self):
         from fast_alpr.default_detector import DefaultDetector
         from fast_alpr.default_ocr import DefaultOCR
-        self.detector = DefaultDetector(model_name=config.ALPR_DETECTOR,
-                                        conf_thresh=config.ALPR_DET_CONF)
-        self.ocr = DefaultOCR(hub_ocr_model=config.ALPR_OCR, device="cpu")
+        def build():
+            providers = device.ort_providers()      # CUDA first, CPU fallback
+            self.detector = DefaultDetector(model_name=config.ALPR_DETECTOR,
+                                            conf_thresh=config.ALPR_DET_CONF, providers=providers)
+            self.ocr = DefaultOCR(hub_ocr_model=config.ALPR_OCR,
+                                  device="cuda" if device.ort_uses_cuda() else "cpu",
+                                  providers=providers)
+        try:
+            build()
+        except Exception:
+            if not device.ort_uses_cuda():
+                raise
+            device.force_ort_cpu()                  # broken CUDA setup: retry on CPU
+            build()
 
     def boxes(self, crop_bgr: np.ndarray) -> list[tuple[float, int, int, int, int]]:
         h, w = crop_bgr.shape[:2]
@@ -63,7 +74,13 @@ class FastAlprPlateReader:
 class RapidOcrPlateReader:
     def __init__(self):
         from rapidocr_onnxruntime import RapidOCR
-        self.ocr = RapidOCR()
+        gpu = device.ort_uses_cuda()
+        try:
+            self.ocr = RapidOCR(det_use_cuda=gpu, cls_use_cuda=gpu, rec_use_cuda=gpu)
+        except Exception:
+            if not gpu:
+                raise
+            self.ocr = RapidOCR()                   # broken CUDA setup: CPU
 
     @staticmethod
     def _clean_text(text: str) -> str:

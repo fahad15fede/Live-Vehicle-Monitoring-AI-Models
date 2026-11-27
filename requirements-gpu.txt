@@ -1,0 +1,24 @@
+# NVIDIA GPU builds - target: GeForce RTX 5060 Laptop GPU (8 GB, Blackwell / sm_120).
+# RTX 50-series needs CUDA >= 12.8; these are all CUDA 13.0 builds, so PyTorch and
+# ONNX Runtime share one CUDA version. Needs an NVIDIA driver with CUDA 13 support (R580+).
+# Python 3.11-3.14, Windows x64.
+#
+# Install (inside the project's venv), in this order:
+#   pip install -r requirements.txt                     # everything else (pulls CPU torch/onnxruntime)
+#   pip uninstall -y torch torchvision onnxruntime      # remove the CPU builds
+#   pip install -r requirements-gpu.txt                 # CUDA builds
+#   python -m kst.device                                # must say "GPU ... RTX 5060" and CUDAExecutionProvider
+#
+# Do not keep `onnxruntime` and `onnxruntime-gpu` installed together: they share one
+# package folder and the CPU one silently wins. pip may warn that rapidocr / fast-alpr
+# want "onnxruntime"; that is harmless, onnxruntime-gpu provides the same module.
+
+--extra-index-url https://download.pytorch.org/whl/cu130
+
+# PyTorch + CUDA 13.0 runtime and cuDNN (bundled in the wheel) -> Ultralytics vehicle detector
+torch==2.14.1+cu130
+torchvision==0.29.1+cu130
+
+# ONNX Runtime with CUDA -> fast-alpr plate detector + plate OCR, RapidOCR, ONNX vehicle model.
+# [cuda,cudnn] pulls the CUDA 13 / cuDNN 9 DLLs as pip wheels (no CUDA Toolkit install needed).
+onnxruntime-gpu[cuda,cudnn]==1.32.0

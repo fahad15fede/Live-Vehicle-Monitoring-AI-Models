@@ -30,6 +30,7 @@ DEMO_VIDEO_MEMBER = (
 )
 
 # ---------------------------------------------------------------- vehicle detection
+DETECT_IMGSZ = 640               # detector input size
 VEHICLE_CONF = 0.25
 PLATE_CONF = 0.15
 NMS_IOU = 0.45
@@ -46,11 +47,22 @@ TWO_WHEELER_CONF = 0.20
 # Vehicles are counted when they enter it and analysed (plate / colour) while inside it.
 READING_ZONE = (0.40, 1.00)
 MAX_ANALYSES_PER_TRACK = 4
-ANALYSES_PER_FRAME = 3          # CPU cap, internal only
+ANALYSES_PER_FRAME = 3          # plate/colour analyses per frame on CPU
+ANALYSES_PER_FRAME_GPU = 8      # ...and on GPU (the plate models are tiny there)
 # Burned-in camera on-screen text (timestamp / MAC address), as frame fractions
 # (x1, y1, x2, y2). Plate boxes found here are ignored. Default = demo camera's OSD.
 OSD_MASKS = [(0.0, 0.85, 0.5, 1.0)]
-DEFAULT_SKIP_FRAMES = 5         # analyse 1 frame, skip 5, analyse the next
+DEFAULT_SKIP_FRAMES = 5         # video files on CPU: analyse 1 frame, skip 5, analyse the next
+DEFAULT_SKIP_FRAMES_GPU = 0     # video files on GPU: analyse every frame
+# Live view: frames sent to the browser are downscaled to this width (JPEG) to keep the UI smooth.
+DISPLAY_MAX_WIDTH = 1280
+DISPLAY_FPS = 20                # browser refresh rate of the live view
+# A live run whose page stopped polling this long ago (tab closed) stops itself, freeing the GPU.
+LIVE_IDLE_TIMEOUT_S = 30
+# FFmpeg hardware video decoding (D3D11VA). Off: it failed on some H.264 RTSP streams
+# ("hardware accelerator failed to decode picture"), and CPU decoding of one stream is cheap,
+# leaving the GPU to inference. If enabled and a stream fails with it, it falls back to CPU.
+HW_VIDEO_DECODE = False
 MIN_CROP_SIDE = 40
 
 # ---------------------------------------------------------------- plates
